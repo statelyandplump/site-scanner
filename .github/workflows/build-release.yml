@@ -1,0 +1,93 @@
+# GitHub Actions workflow — builds Windows and macOS in one go.
+#
+# PyInstaller CANNOT cross-compile: a Mac build has to run on a Mac. That is the
+# whole reason this file exists rather than a build script. GitHub gives you a
+# macOS runner for free, so nobody needs to own a Mac to ship the Mac build.
+#
+# Lives at .github/workflows/build-release.yml, with this folder as the repo root.
+# Trigger:  git tag v1.0.0 && git push origin v1.0.0
+# Result:   a Release with SiteScanner-windows.exe and SiteScanner-macos.zip
+#
+# Both artifacts are UNSIGNED. See the README section on first-run warnings.
+
+name: Build Site Scanner
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:        # lets you build from the Actions tab without tagging
+
+permissions:
+  contents: write           # needed to create the Release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false      # a Mac failure should not bin the Windows build
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: SiteScanner-windows
+            path: dist/SiteScanner.exe
+          - os: macos-latest
+            artifact: SiteScanner-macos
+            path: dist/SiteScanner.app
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The scanner is stdlib-only, so PyInstaller is the sole dependency.
+      - run: pip install pyinstaller
+
+      # Never ship a build that fails its own controls.
+      - run: python test_checks.py
+      - run: python test_gui.py
+
+      - run: pyinstaller --onefile --windowed --name SiteScanner scanner_gui.py
+
+      # .app is a directory; zip it so the download stays a single file and
+      # keeps its executable bit.
+      - name: Zip the macOS app
+        if: matrix.os == 'macos-latest'
+        run: cd dist && zip -r SiteScanner-macos.zip SiteScanner.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/SiteScanner.exe
+            dist/SiteScanner-macos.zip
+          if-no-files-found: ignore
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          body: |
+            Download the file for your machine, then see "First run" below.
+
+            **Windows** — `SiteScanner.exe`. Windows will say "Windows protected
+            your PC" because the file is not code-signed. Click **More info**,
+            then **Run anyway**. It only has to be done once.
+
+            **macOS** — `SiteScanner-macos.zip`. Unzip, then **right-click the
+            app and choose Open** (double-clicking will be blocked). Confirm once
+            and it opens normally from then on.
+
+            Both warnings are about the absence of a paid signing certificate,
+            not about the app.

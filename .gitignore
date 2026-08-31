@@ -1,0 +1,21 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Scan output — regenerable, and client data does not belong in a repo
+scan-*.html
+scan-*.csv
+scan-*.json
+
+# Internal notes that are not part of the tool: how it maps onto an in-house
+# reporting process, and the workspace overview that tracks it. The published
+# tool is deliberately neutral; these are not.
+SCORECARD-INTEGRATION.md
+_overview.md
+
+# Backups from the neutralising pass
+*.pre-neutral
+
+__pycache__/
+*.pyc
