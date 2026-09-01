@@ -12,6 +12,7 @@ builder the scanner uses and assert each issue is raised.
 
 import hashlib
 import json
+import math
 import os
 import sys
 
@@ -132,11 +133,24 @@ def flatten(groups):
 # overlap is length-sensitive: swapping one word kills the 6 windows spanning it,
 # so on a 35-word stub two near-identical pages score ~0.5, while on a 350-word
 # page they score ~0.94. An unrealistically short fixture fails a working check.
+# Deliberately larger than TOPIC_MIN_TERMS by a wide margin. An earlier version
+# had ~40 words, so every generated page landed right at the distinct-term floor
+# and got filtered — which made three separate checks look broken when the
+# fixtures were the problem.
 LEXICON = ("therapy support anxiety depression trauma couples grief parenting "
            "sessions clinician practice referral intake insurance evening weekend "
            "telehealth office appointment consultation approach evidence outcomes "
            "adolescents adults veterans clinicians training supervision community "
-           "recovery burnout boundaries attachment nervous system regulation").split()
+           "recovery burnout boundaries attachment nervous system regulation "
+           "assessment diagnosis medication psychiatry mindfulness somatic "
+           "exposure rumination avoidance compassion resilience caregiver "
+           "postpartum bereavement identity transition workplace conflict "
+           "communication trust intimacy separation reconciliation coaching "
+           "adhd autism sensory processing sleep nutrition movement journaling "
+           "worksheet homework relapse prevention coping distress tolerance "
+           "validation attunement rupture repair alliance outcome measure "
+           "screening waitlist scheduling reminder cancellation policy fee "
+           "sliding scale superbill reimbursement deductible copay network").split()
 
 
 def prose(seed, words=340):
@@ -522,6 +536,89 @@ def test_topic_overlap():
     check("real terms kept", "anxiety" in S.terms_of("anxiety therapy helps"))
 
 
+def test_similarity_map():
+    """The map has to be reproducible, self-contained, and geometrically honest."""
+    print("\nsimilarity map")
+    pages = [{"url": "https://ex.com/p%d/" % i, "words": 340,
+              "terms": S.terms_of(service_page(i))} for i in range(24)]
+    check("fixtures clear the distinct-term floor",
+          min(len(p["terms"]) for p in pages) >= S.TOPIC_MIN_TERMS,
+          min(len(p["terms"]) for p in pages))
+
+    nodes, edges = S.similarity_graph(pages)
+    check("graph has nodes", len(nodes) == 24, len(nodes))
+    check("edges are capped per node, not every pair",
+          len(edges) <= 24 * S.MAP_EDGES_PER_NODE, len(edges))
+    check("every edge carries a weight above the floor",
+          all(w >= S.MAP_EDGE_FLOOR for _, _, w in edges))
+    check("no self-edges", all(a != b for a, b, _ in edges))
+
+    # Determinism is the whole reason the layout seeds on a spiral, not an RNG:
+    # the same site scanned twice must draw the same picture.
+    first = S.layout_force(len(nodes), edges)
+    second = S.layout_force(len(nodes), edges)
+    check("layout is deterministic across runs", first == second)
+    check("layout produces finite coordinates",
+          all(math.isfinite(x) and math.isfinite(y) for x, y in first))
+    check("nodes do not all collapse to one point",
+          len({(round(x, 3), round(y, 3)) for x, y in first}) > len(first) // 2,
+          len({(round(x, 3), round(y, 3)) for x, y in first}))
+
+    flagged = [pages[0]["url"], pages[1]["url"]]
+    svg = S.render_map_svg(pages, [flagged])
+    check("svg renders", svg.startswith("<svg") and svg.endswith("</svg>"))
+    check("svg is self-contained — no script", "<script" not in svg)
+    check("svg has no external references",
+          "http://" not in svg.replace('xmlns="http://www.w3.org/2000/svg"', ""))
+    check("svg carries an aria-label for screen readers", 'aria-label=' in svg)
+    check("colours come from CSS vars, not baked hex", "#" not in svg, svg[:200])
+    check("every mark has a hover title", svg.count("<title>") == len(nodes),
+          (svg.count("<title>"), len(nodes)))
+    check("hover targets are larger than the marks", 'class="hit"' in svg)
+    # ONE label per cluster, not one per page — members overlap by construction.
+    check("clusters get one label each, not one per page",
+          svg.count("<text") == 1, svg.count("<text"))
+    check("the label states how many pages", "2 pages, same topic" in svg)
+    check("two clusters get two labels",
+          S.render_map_svg(pages, [[pages[0]["url"], pages[1]["url"]],
+                                   [pages[2]["url"], pages[3]["url"]]]
+                           ).count("<text") == 2)
+    check("blog pages are drawn as squares, not colour-only",
+          "<rect" in S.render_map_svg(
+              pages + [{"url": "https://ex.com/blog/x/", "words": 340,
+                        "terms": S.terms_of(service_page(99))}], [flagged]))
+
+    # Coordinates must stay inside the viewBox or marks clip at the edge.
+    import re as _re
+    coords = [float(v) for v in _re.findall(r'c[xy]="([-\d.]+)"', svg)]
+    check("all marks sit inside the viewBox",
+          all(-2 <= c <= max(S.MAP_W, S.MAP_H) + 2 for c in coords),
+          (min(coords), max(coords)))
+
+    check("too few pages renders nothing rather than a broken chart",
+          S.render_map_svg(pages[:2], []) == "")
+
+    # Dark mode is not an afterthought: any hex outside a token block is a
+    # colour that cannot swap, and the report is read in both modes. A stray
+    # `details[open]{background:#fcfcfd}` shipped a white panel with white text.
+    css_lines = [l for l in S.HTML_CSS.splitlines()
+                 if "#" in l and not l.strip().startswith("--")]
+    check("no hardcoded colours outside the theme tokens", not css_lines, css_lines)
+    for token in ("--bg", "--fg", "--card", "--line", "--s1", "--s2", "--s3"):
+        light = S.HTML_CSS.count(token + ":")
+        check("%s is defined for light and both dark scopes" % token,
+              light >= 3, light)
+
+    # Gravity check: pages with NO edges must stay in frame, not ring the edge.
+    # Without a centring force they feel only repulsion and escape to the border,
+    # crushing everything that matters into the middle.
+    lonely = S.layout_force(30, [])
+    mid = S.LAYOUT_SPAN / 2
+    spread = max(math.hypot(x - mid, y - mid) for x, y in lonely)
+    check("edgeless nodes stay near the centre, not flung to a ring",
+          spread < S.LAYOUT_SPAN * 0.75, round(spread, 1))
+
+
 def test_indexability_and_exact():
     """Match Screaming Frog: exact dupes separately, indexable pages only."""
     print("\nexact duplicates and indexability")
@@ -733,6 +830,7 @@ def main():
     test_blog_segmentation()
     test_indexability_and_exact()
     test_topic_overlap()
+    test_similarity_map()
     test_throttle_retry()
     test_siteliner_caveat()
     print("")

@@ -667,6 +667,130 @@ def topic_clusters(pages, threshold=TOPIC_RATIO, include_blog=False):
     return clusters
 
 
+GOLDEN_ANGLE = 2.399963229728653
+MAP_EDGE_FLOOR = 0.22   # below this, an edge says nothing
+MAP_EDGES_PER_NODE = 3  # keep each page's strongest few; a dense hairball reads as noise
+
+
+def similarity_graph(pages, floor=MAP_EDGE_FLOOR, per_node=MAP_EDGES_PER_NODE):
+    """Nodes plus a k-nearest-neighbour edge list, by TF-IDF cosine.
+
+    Every pair above the floor would be a hairball on a 120-page site, so each
+    page keeps only its strongest few links. The clusters survive that; the
+    noise does not.
+    """
+    live = [p for p in pages if len(p.get("terms") or ()) >= TOPIC_MIN_TERMS]
+    if len(live) < 3:
+        return [], []
+
+    vectors = tfidf_vectors(live)
+    best = defaultdict(list)
+    for i in range(len(live)):
+        for j in range(i + 1, len(live)):
+            score = cosine(vectors[i], vectors[j])
+            if score >= floor:
+                best[i].append((score, j))
+                best[j].append((score, i))
+
+    edges = {}
+    for i, candidates in best.items():
+        candidates.sort(reverse=True)
+        for score, j in candidates[:per_node]:
+            edges[frozenset((i, j))] = score
+    return live, [(min(p), max(p), s) for p, s in
+                  sorted(edges.items(), key=lambda kv: kv[1])]
+
+
+LAYOUT_SPAN = 1000.0
+LAYOUT_GRAVITY = 1.0    # 1.0 puts equilibrium at about the domain radius
+
+
+def layout_force(node_count, edges, iterations=300):
+    """Fruchterman-Reingold spring layout. Deterministic — no RNG.
+
+    Same site scanned twice must draw the same picture, or two runs cannot be
+    compared. Initial placement is a golden-angle spiral for that reason.
+
+    Two things this has to get right, both learned by looking at the output:
+
+    - **Gravity is not optional.** Most pages on a real site share vocabulary
+      with nothing, so they have no edges and feel only repulsion — which flings
+      them to the boundary and draws a ring with everything interesting crushed
+      in the middle. A pull toward the centre keeps unconnected pages in frame.
+    - **Scale the domain, not the forces.** Working in a 1000-unit square with
+      k = sqrt(area/n) puts the equilibrium edge length at k, where repulsion
+      k^2/d and attraction d^2/k balance. In normalised 0-1 coordinates the same
+      formulas overshoot on every step and the graph never settles.
+    """
+    if node_count < 1:
+        return []
+
+    centre = LAYOUT_SPAN / 2.0
+    pos = []
+    for i in range(node_count):
+        radius = math.sqrt((i + 0.5) / node_count) * centre * 0.9
+        angle = i * GOLDEN_ANGLE
+        pos.append([centre + radius * math.cos(angle),
+                    centre + radius * math.sin(angle)])
+
+    k = math.sqrt((LAYOUT_SPAN * LAYOUT_SPAN) / node_count)
+    temp = LAYOUT_SPAN / 8.0
+    cooling = temp / (iterations + 1)
+    min_dist = k * 0.01
+
+    # Gravity has to balance repulsion, and total repulsion on one node grows
+    # with node count: roughly n*k^2/R at radius R. Setting the inward pull to
+    # n*k^2/centre^2 per unit of offset puts equilibrium near the domain radius.
+    # Since k^2 = span^2/n, the n cancels and this is simply 4*LAYOUT_GRAVITY —
+    # derived rather than tuned, which is why it holds at any page count.
+    gravity = LAYOUT_GRAVITY * node_count * k * k / (centre * centre)
+
+    for _ in range(iterations):
+        disp = [[0.0, 0.0] for _ in range(node_count)]
+
+        for i in range(node_count):
+            xi, yi = pos[i]
+            for j in range(i + 1, node_count):
+                dx, dy = xi - pos[j][0], yi - pos[j][1]
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist < min_dist:
+                    # Deterministic nudge apart, never a random one.
+                    dx, dy = (i - j) or 1, (j - i) or 1
+                    dist = math.sqrt(dx * dx + dy * dy)
+                force = (k * k) / dist
+                ux, uy = dx / dist, dy / dist
+                disp[i][0] += ux * force
+                disp[i][1] += uy * force
+                disp[j][0] -= ux * force
+                disp[j][1] -= uy * force
+
+        for a, b, weight in edges:
+            dx, dy = pos[a][0] - pos[b][0], pos[a][1] - pos[b][1]
+            dist = math.sqrt(dx * dx + dy * dy) or min_dist
+            # Similarity scales the spring, so closer really does mean more
+            # alike — the one inference the reader may draw from distance.
+            force = (dist * dist) / k * weight
+            ux, uy = dx / dist, dy / dist
+            disp[a][0] -= ux * force
+            disp[a][1] -= uy * force
+            disp[b][0] += ux * force
+            disp[b][1] += uy * force
+
+        for i in range(node_count):
+            disp[i][0] += (centre - pos[i][0]) * gravity
+            disp[i][1] += (centre - pos[i][1]) * gravity
+
+            dx, dy = disp[i]
+            length = math.sqrt(dx * dx + dy * dy)
+            if length > 1e-12:
+                step = min(length, temp) / length
+                pos[i][0] += dx * step
+                pos[i][1] += dy * step
+        temp -= cooling
+
+    return pos
+
+
 def jaccard(a, b):
     if not a or not b:
         return 0.0
@@ -1375,6 +1499,101 @@ def write_csv(path, findings):
                 ])
 
 
+MAP_W, MAP_H, MAP_PAD = 760, 470, 34
+
+
+def short_path(url, limit=30):
+    path = urllib.parse.urlparse(url).path.strip("/") or "/"
+    return path if len(path) <= limit else path[:limit - 1] + "…"
+
+
+def render_map_svg(pages, clusters):
+    """Inline SVG content-similarity map. No script, no external anything.
+
+    Distance means similarity, so the reader can infer clusters from position —
+    which is the whole point of the picture and the one inference the layout
+    actually supports.
+
+    Identity is never colour alone: each category also has its own shape, the
+    legend is always present, and the flagged pages carry direct labels. Light
+    mode puts the aqua slot under 3:1 against the surface, and the palette's
+    relief rule wants labels or a table for that — the report has both.
+    """
+    nodes, edges = similarity_graph(pages)
+    if len(nodes) < 3:
+        return ""
+    flagged_urls = {u for group in clusters for u in group}
+
+    pos = layout_force(len(nodes), edges)
+    xs = [p[0] for p in pos]
+    ys = [p[1] for p in pos]
+    span_x = (max(xs) - min(xs)) or 1.0
+    span_y = (max(ys) - min(ys)) or 1.0
+    # One scale for both axes: distance must mean the same thing horizontally
+    # and vertically, or the clusters are a lie.
+    scale = min((MAP_W - 2 * MAP_PAD) / span_x, (MAP_H - 2 * MAP_PAD) / span_y)
+    cx_off = (MAP_W - span_x * scale) / 2 - min(xs) * scale
+    cy_off = (MAP_H - span_y * scale) / 2 - min(ys) * scale
+    screen = [(x * scale + cx_off, y * scale + cy_off) for x, y in pos]
+
+    def category(url):
+        if url in flagged_urls:
+            return "flagged"
+        return "blog" if is_blog(url) else "other"
+
+    out = ['<svg class="map" viewBox="0 0 %d %d" role="img" '
+           'aria-label="Content similarity map: each mark is a page, and pages '
+           'placed closer together share more vocabulary." '
+           'xmlns="http://www.w3.org/2000/svg">' % (MAP_W, MAP_H)]
+
+    out.append('<g class="map-edges">')
+    for a, b, weight in edges:
+        ax, ay = screen[a]
+        bx, by = screen[b]
+        out.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" '
+                   'stroke-width="%.2f" opacity="%.2f"/>'
+                   % (ax, ay, bx, by, 0.6 + weight * 1.6, 0.10 + weight * 0.35))
+    out.append("</g>")
+
+    out.append('<g class="map-nodes">')
+    where = {}
+    for i, page in enumerate(nodes):
+        x, y = screen[i]
+        where[page["url"]] = (x, y)
+        kind = category(page["url"])
+        title = "%s %d words" % (short_path(page["url"], 70), page["words"])
+        out.append('<g class="n-%s"><title>%s</title>' % (kind, esc(title)))
+        if kind == "blog":
+            out.append('<rect x="%.1f" y="%.1f" width="9" height="9" rx="1.5"/>'
+                       % (x - 4.5, y - 4.5))
+        else:
+            out.append('<circle cx="%.1f" cy="%.1f" r="%d"/>'
+                       % (x, y, 7 if kind == "flagged" else 5))
+        # Hover target larger than the mark; an 8px dot is not a hit area.
+        out.append('<circle class="hit" cx="%.1f" cy="%.1f" r="13"/></g>' % (x, y))
+    out.append("</g>")
+
+    # One label per CLUSTER, at its centroid — never one per page. Cluster
+    # members sit almost on top of each other by construction, so per-page
+    # labels overprint into an unreadable smear. Learned by looking at it.
+    out.append('<g class="map-labels">')
+    for group in clusters:
+        points = [where[u] for u in group if u in where]
+        if not points:
+            continue
+        mx = sum(p[0] for p in points) / len(points)
+        my = sum(p[1] for p in points) / len(points)
+        spread = max([abs(p[0] - mx) for p in points] or [0])
+        anchor = "end" if mx > MAP_W * 0.6 else "start"
+        offset = spread + 15
+        out.append('<text x="%.1f" y="%.1f" text-anchor="%s">'
+                   "%d pages, same topic</text>"
+                   % (mx + (-offset if anchor == "end" else offset),
+                      my + 4, anchor, len(group)))
+    out.append("</g></svg>")
+    return "".join(out)
+
+
 def esc(s):
     return html.escape(str(s), quote=True)
 
@@ -1385,8 +1604,21 @@ def link_cell(url):
 
 
 HTML_CSS = """
-:root{--bg:#fff;--fg:#1a1d21;--mut:#6b7280;--line:#e5e7eb;--card:#f9fafb;
---hi:#b42318;--md:#b54708;--lo:#175cd3;}
+:root{color-scheme:light;
+--bg:#fcfcfb;--fg:#0b0b0b;--mut:#52514e;--line:#e5e7eb;--card:#f6f6f4;
+--hi:#b42318;--md:#b54708;--lo:#175cd3;
+--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--edge:#52514e;}
+/* Dark is selected, not an inverted flip: the same three hues re-stepped for
+   the dark surface and validated against it as a set. */
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+color-scheme:dark;
+--bg:#1a1a19;--fg:#fff;--mut:#c3c2b7;--line:#33332f;--card:#232320;
+--hi:#f97066;--md:#fdb022;--lo:#84caff;
+--s1:#3987e5;--s2:#d95926;--s3:#199e70;--edge:#c3c2b7;}}
+:root[data-theme="dark"]{color-scheme:dark;
+--bg:#1a1a19;--fg:#fff;--mut:#c3c2b7;--line:#33332f;--card:#232320;
+--hi:#f97066;--md:#fdb022;--lo:#84caff;
+--s1:#3987e5;--s2:#d95926;--s3:#199e70;--edge:#c3c2b7;}
 *{box-sizing:border-box}
 body{margin:0;padding:32px 24px 64px;background:var(--bg);color:var(--fg);
 font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
@@ -1398,7 +1630,7 @@ border:1px solid var(--line);border-radius:10px;margin-bottom:32px}
 .stat b{display:block;font-size:22px;line-height:1.2}
 .stat span{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
 details{border:1px solid var(--line);border-radius:10px;margin-bottom:12px;overflow:hidden}
-details[open]{background:#fcfcfd}
+details[open]{background:var(--card)}
 summary{cursor:pointer;padding:14px 18px;font-weight:600;display:flex;
 align-items:center;gap:12px;list-style:none}
 summary::-webkit-details-marker{display:none}
@@ -1414,9 +1646,29 @@ padding:3px 8px;border-radius:999px;border:1px solid currentColor}
 table{width:100%;border-collapse:collapse;font-size:13.5px}
 th{text-align:left;color:var(--mut);font-weight:600;font-size:11px;
 text-transform:uppercase;letter-spacing:.04em;padding:6px 10px;border-bottom:1px solid var(--line)}
-td{padding:7px 10px;border-bottom:1px solid #f1f2f4;vertical-align:top;word-break:break-word}
+td{padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top;
+word-break:break-word}
 tr:last-child td{border-bottom:none}
-a{color:#175cd3;text-decoration:none}a:hover{text-decoration:underline}
+a{color:var(--lo);text-decoration:none}a:hover{text-decoration:underline}
+/* -- content similarity map -- */
+.mapwrap{border:1px solid var(--line);border-radius:10px;padding:14px 16px 6px;
+margin-bottom:14px;background:var(--card)}
+.mapwrap h2{font-size:15px;margin:0 0 2px}
+.map{width:100%;height:auto;display:block;overflow:visible}
+.map-edges line{stroke:var(--edge)}
+.map-nodes circle,.map-nodes rect{stroke:var(--card);stroke-width:2}
+.n-flagged circle{fill:var(--s1)}
+.n-blog rect{fill:var(--s2)}
+.n-other circle{fill:var(--s3)}
+.map-nodes .hit{fill:transparent;stroke:none}
+.map-nodes g:hover circle:not(.hit),.map-nodes g:hover rect{stroke:var(--fg)}
+.map-labels text{font-size:11px;fill:var(--fg);paint-order:stroke;
+stroke:var(--card);stroke-width:3px;stroke-linejoin:round}
+.legend{display:flex;gap:18px;flex-wrap:wrap;align-items:center;
+font-size:12.5px;color:var(--mut);padding:4px 2px 8px}
+.legend span{display:inline-flex;align-items:center;gap:7px}
+.key{width:11px;height:11px;border-radius:50%;display:inline-block}
+.key.sq{border-radius:2px}
 .detail{color:var(--mut)}
 .clean{padding:40px;text-align:center;background:var(--card);border-radius:10px;
 border:1px solid var(--line)}
@@ -1454,6 +1706,30 @@ def write_html(path, domain, findings, live, pages, elapsed, cache_size, opts,
         parts.append('<div class="stat"><b>%s</b><span>%s</span></div>'
                      % (esc(val), esc(label)))
     parts.append("</div>")
+
+    topic_groups = [[r["url"]] + r.get("group", [])
+                    for r in (findings.get("content_topic") or [])]
+    flagged = {u for group in topic_groups for u in group}
+    svg = render_map_svg([p for p in live if is_indexable(p)], topic_groups)
+    if svg:
+        parts.append('<div class="mapwrap">')
+        parts.append("<h2>Content similarity map</h2>")
+        parts.append('<p class="sub" style="margin:0 0 6px">Each mark is a page. '
+                     'Pages sitting closer together share more of their '
+                     'vocabulary, and lines join each page to its nearest '
+                     'matches. Tight knots are worth a look.</p>')
+        parts.append('<div class="legend">')
+        for cls, label, count_of in (
+                ("s1", "Same-topic cluster", len(flagged)),
+                ("s2", "Blog post", sum(1 for p in live if is_blog(p["url"]))),
+                ("s3", "Other page", 0)):
+            shape = " sq" if cls == "s2" else ""
+            tail = " (%d)" % count_of if count_of else ""
+            parts.append('<span><i class="key%s" style="background:var(--%s)"></i>'
+                         "%s%s</span>" % (shape, cls, esc(label), tail))
+        parts.append("</div>")
+        parts.append(svg)
+        parts.append("</div>")
 
     if not total:
         parts.append('<div class="clean"><h2>Clean</h2>'
