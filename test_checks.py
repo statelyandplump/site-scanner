@@ -545,8 +545,16 @@ def test_similarity_map():
           min(len(p["terms"]) for p in pages) >= S.TOPIC_MIN_TERMS,
           min(len(p["terms"]) for p in pages))
 
-    nodes, edges = S.similarity_graph(pages)
+    nodes, edges, neighbours = S.similarity_graph(pages)
     check("graph has nodes", len(nodes) == 24, len(nodes))
+    check("neighbours are capped per page",
+          all(len(v) <= S.NEIGHBOURS_PER_PAGE for v in neighbours.values()))
+    check("neighbour indices are valid against the returned node list",
+          all(0 <= j < len(nodes) for v in neighbours.values() for _, j in v))
+    check("neighbours are sorted strongest first",
+          all(list(v) == sorted(v, reverse=True) for v in neighbours.values()))
+    check("no page is its own neighbour",
+          all(i != j for i, v in neighbours.items() for _, j in v))
     check("edges are capped per node, not every pair",
           len(edges) <= 24 * S.MAP_EDGES_PER_NODE, len(edges))
     check("every edge carries a weight above the floor",
@@ -565,7 +573,24 @@ def test_similarity_map():
           len({(round(x, 3), round(y, 3)) for x, y in first}))
 
     flagged = [pages[0]["url"], pages[1]["url"]]
-    svg = S.render_map_svg(pages, [flagged])
+    svg, near_rows = S.render_map_svg(pages, [flagged])
+
+    # The map must be usable, not just pretty: every mark opens its page, and
+    # the rows below say what to compare with what.
+    check("every mark is a link", svg.count("<a href=") == len(nodes),
+          (svg.count("<a href="), len(nodes)))
+    check("links open in a new tab safely", 'rel="noopener"' in svg)
+    check("tooltips name the closest matches", "Closest:" in svg)
+    check("tooltips say the mark is clickable", "Click to open" in svg)
+    check("a neighbour table comes back with the svg", len(near_rows) > 0)
+    check("table rows are sorted strongest match first",
+          [r["top"] for r in near_rows] == sorted(
+              (r["top"] for r in near_rows), reverse=True))
+    check("each row names its matches",
+          all(r["matches"] and all(isinstance(p, str) for p, _ in r["matches"])
+              for r in near_rows))
+    check("flagged pages are marked in the table",
+          any(r["flagged"] for r in near_rows))
     check("svg renders", svg.startswith("<svg") and svg.endswith("</svg>"))
     check("svg is self-contained — no script", "<script" not in svg)
     check("svg has no external references",
@@ -582,11 +607,11 @@ def test_similarity_map():
     check("two clusters get two labels",
           S.render_map_svg(pages, [[pages[0]["url"], pages[1]["url"]],
                                    [pages[2]["url"], pages[3]["url"]]]
-                           ).count("<text") == 2)
+                           )[0].count("<text") == 2)
     check("blog pages are drawn as squares, not colour-only",
           "<rect" in S.render_map_svg(
               pages + [{"url": "https://ex.com/blog/x/", "words": 340,
-                        "terms": S.terms_of(service_page(99))}], [flagged]))
+                        "terms": S.terms_of(service_page(99))}], [flagged])[0])
 
     # Coordinates must stay inside the viewBox or marks clip at the edge.
     import re as _re
@@ -596,7 +621,7 @@ def test_similarity_map():
           (min(coords), max(coords)))
 
     check("too few pages renders nothing rather than a broken chart",
-          S.render_map_svg(pages[:2], []) == "")
+          S.render_map_svg(pages[:2], []) == ("", []))
 
     # Dark mode is not an afterthought: any hex outside a token block is a
     # colour that cannot swap, and the report is read in both modes. A stray

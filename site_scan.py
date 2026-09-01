@@ -672,16 +672,24 @@ MAP_EDGE_FLOOR = 0.22   # below this, an edge says nothing
 MAP_EDGES_PER_NODE = 3  # keep each page's strongest few; a dense hairball reads as noise
 
 
-def similarity_graph(pages, floor=MAP_EDGE_FLOOR, per_node=MAP_EDGES_PER_NODE):
-    """Nodes plus a k-nearest-neighbour edge list, by TF-IDF cosine.
+NEIGHBOURS_PER_PAGE = 3
 
-    Every pair above the floor would be a hairball on a 120-page site, so each
-    page keeps only its strongest few links. The clusters survive that; the
-    noise does not.
+
+def similarity_graph(pages, floor=MAP_EDGE_FLOOR, per_node=MAP_EDGES_PER_NODE):
+    """Returns (nodes, edges, neighbours), all by TF-IDF cosine.
+
+    Every pair above the floor would be a hairball on a 120-page site, so the
+    drawn edges keep only each page's strongest few links. `neighbours` is the
+    same data unpruned to a per-page top-N, because "what is this page closest
+    to" is the question a reader actually has, and it should not be answerable
+    only for the pages that happened to get flagged.
+
+    The cosine loop is the expensive part of a scan, so both come out of one
+    pass rather than being recomputed.
     """
     live = [p for p in pages if len(p.get("terms") or ()) >= TOPIC_MIN_TERMS]
     if len(live) < 3:
-        return [], []
+        return [], [], {}
 
     vectors = tfidf_vectors(live)
     best = defaultdict(list)
@@ -692,13 +700,16 @@ def similarity_graph(pages, floor=MAP_EDGE_FLOOR, per_node=MAP_EDGES_PER_NODE):
                 best[i].append((score, j))
                 best[j].append((score, i))
 
-    edges = {}
+    edges, neighbours = {}, {}
     for i, candidates in best.items():
         candidates.sort(reverse=True)
+        neighbours[i] = candidates[:NEIGHBOURS_PER_PAGE]
         for score, j in candidates[:per_node]:
             edges[frozenset((i, j))] = score
-    return live, [(min(p), max(p), s) for p, s in
-                  sorted(edges.items(), key=lambda kv: kv[1])]
+    return (live,
+            [(min(p), max(p), s) for p, s in
+             sorted(edges.items(), key=lambda kv: kv[1])],
+            neighbours)
 
 
 LAYOUT_SPAN = 1000.0
@@ -1519,9 +1530,9 @@ def render_map_svg(pages, clusters):
     mode puts the aqua slot under 3:1 against the surface, and the palette's
     relief rule wants labels or a table for that — the report has both.
     """
-    nodes, edges = similarity_graph(pages)
+    nodes, edges, neighbours = similarity_graph(pages)
     if len(nodes) < 3:
-        return ""
+        return "", []
     flagged_urls = {u for group in clusters for u in group}
 
     pos = layout_force(len(nodes), edges)
@@ -1562,7 +1573,18 @@ def render_map_svg(pages, clusters):
         where[page["url"]] = (x, y)
         kind = category(page["url"])
         title = "%s %d words" % (short_path(page["url"], 70), page["words"])
-        out.append('<g class="n-%s"><title>%s</title>' % (kind, esc(title)))
+        near = neighbours.get(i) or []
+        if near:
+            # The tooltip carries the answer, not just a name: what this page is
+            # closest to. A dot you can only identify by hovering, then hunting
+            # for it in a table, is not usable information.
+            title += "\nClosest: " + ", ".join(
+                "%s %d%%" % (short_path(nodes[j]["url"], 32), round(s * 100))
+                for s, j in near)
+        title += "\nClick to open"
+        # SVG <a> is native and needs no script, so every mark opens its page.
+        out.append('<a href="%s" target="_blank" rel="noopener" class="n-%s">'
+                   "<title>%s</title>" % (esc(page["url"]), kind, esc(title)))
         if kind == "blog":
             out.append('<rect x="%.1f" y="%.1f" width="9" height="9" rx="1.5"/>'
                        % (x - 4.5, y - 4.5))
@@ -1570,7 +1592,7 @@ def render_map_svg(pages, clusters):
             out.append('<circle cx="%.1f" cy="%.1f" r="%d"/>'
                        % (x, y, 7 if kind == "flagged" else 5))
         # Hover target larger than the mark; an 8px dot is not a hit area.
-        out.append('<circle class="hit" cx="%.1f" cy="%.1f" r="13"/></g>' % (x, y))
+        out.append('<circle class="hit" cx="%.1f" cy="%.1f" r="13"/></a>' % (x, y))
     out.append("</g>")
 
     # One label per CLUSTER, at its centroid — never one per page. Cluster
@@ -1591,7 +1613,22 @@ def render_map_svg(pages, clusters):
                    % (mx + (-offset if anchor == "end" else offset),
                       my + 4, anchor, len(group)))
     out.append("</g></svg>")
-    return "".join(out)
+
+    # The map answers "is there structure". This answers "what do I open next":
+    # every page with its closest matches, worst offender first.
+    rows = []
+    for i, page in enumerate(nodes):
+        near = neighbours.get(i) or []
+        if near:
+            rows.append({
+                "url": page["url"],
+                "blog": is_blog(page["url"]),
+                "flagged": page["url"] in flagged_urls,
+                "top": round(near[0][0] * 100),
+                "matches": [(nodes[j]["url"], round(s * 100)) for s, j in near],
+            })
+    rows.sort(key=lambda r: -r["top"])
+    return "".join(out), rows
 
 
 def esc(s):
@@ -1650,6 +1687,7 @@ td{padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top;
 word-break:break-word}
 tr:last-child td{border-bottom:none}
 a{color:var(--lo);text-decoration:none}a:hover{text-decoration:underline}
+td.num{white-space:nowrap;text-align:right}
 /* -- content similarity map -- */
 .mapwrap{border:1px solid var(--line);border-radius:10px;padding:14px 16px 6px;
 margin-bottom:14px;background:var(--card)}
@@ -1657,11 +1695,14 @@ margin-bottom:14px;background:var(--card)}
 .map{width:100%;height:auto;display:block;overflow:visible}
 .map-edges line{stroke:var(--edge)}
 .map-nodes circle,.map-nodes rect{stroke:var(--card);stroke-width:2}
+.map-nodes a{cursor:pointer}
 .n-flagged circle{fill:var(--s1)}
 .n-blog rect{fill:var(--s2)}
 .n-other circle{fill:var(--s3)}
 .map-nodes .hit{fill:transparent;stroke:none}
-.map-nodes g:hover circle:not(.hit),.map-nodes g:hover rect{stroke:var(--fg)}
+.map-nodes a:hover circle:not(.hit),.map-nodes a:hover rect{stroke:var(--fg)}
+.map-nodes a:focus-visible circle:not(.hit),.map-nodes a:focus-visible rect{
+stroke:var(--fg);stroke-width:3}
 .map-labels text{font-size:11px;fill:var(--fg);paint-order:stroke;
 stroke:var(--card);stroke-width:3px;stroke-linejoin:round}
 .legend{display:flex;gap:18px;flex-wrap:wrap;align-items:center;
@@ -1710,7 +1751,8 @@ def write_html(path, domain, findings, live, pages, elapsed, cache_size, opts,
     topic_groups = [[r["url"]] + r.get("group", [])
                     for r in (findings.get("content_topic") or [])]
     flagged = {u for group in topic_groups for u in group}
-    svg = render_map_svg([p for p in live if is_indexable(p)], topic_groups)
+    svg, near_rows = render_map_svg([p for p in live if is_indexable(p)],
+                                    topic_groups)
     if svg:
         parts.append('<div class="mapwrap">')
         parts.append("<h2>Content similarity map</h2>")
@@ -1729,7 +1771,42 @@ def write_html(path, domain, findings, live, pages, elapsed, cache_size, opts,
                          "%s%s</span>" % (shape, cls, esc(label), tail))
         parts.append("</div>")
         parts.append(svg)
+        parts.append('<p class="fix" style="padding:2px 2px 0">Every mark is a '
+                     "link — click one to open that page. Hover shows what it "
+                     "sits closest to.</p>")
         parts.append("</div>")
+
+    if near_rows:
+        overlapping = [r for r in near_rows if r["top"] >= 40]
+        parts.append("<details%s><summary>"
+                     % (" open" if any(r["flagged"] for r in near_rows[:12])
+                        else ""))
+        parts.append('<span class="pill low">Detail</span>')
+        parts.append("<span>Closest match for every page</span>")
+        parts.append('<span class="count">%d with 40%%+ overlap</span>'
+                     "</summary>" % len(overlapping))
+        parts.append('<div class="body">')
+        parts.append('<p class="fix">Sorted by strongest match first, so the '
+                     "pages most worth comparing are at the top. High overlap "
+                     "is a reason to look, never a reason to merge on its "
+                     "own.</p>")
+        parts.append("<table><tr><th>Page</th><th>Closest matches</th>"
+                     "<th>Top</th></tr>")
+        for r in near_rows[:150]:
+            tag = " · blog" if r["blog"] else ""
+            flag = ' style="font-weight:600"' if r["flagged"] else ""
+            matches = "<br>".join(
+                "%s <span class='detail'>%d%%</span>" % (link_cell(u), pct)
+                for u, pct in r["matches"])
+            parts.append("<tr%s><td>%s<span class='detail'>%s</span></td>"
+                         "<td>%s</td><td class='detail num'>%d%%</td></tr>"
+                         % (flag, link_cell(r["url"]), esc(tag), matches,
+                            r["top"]))
+        parts.append("</table>")
+        if len(near_rows) > 150:
+            parts.append('<p class="more">Showing 150 of %d. Full data in the '
+                         "JSON export.</p>" % len(near_rows))
+        parts.append("</div></details>")
 
     if not total:
         parts.append('<div class="clean"><h2>Clean</h2>'
@@ -1835,6 +1912,7 @@ class ScanResult(object):
         self.urls_verified = urls_verified
         self.opts = opts
         self.dupe_scope = {"checked": len(live), "skipped_not_indexable": 0}
+        self.nearest = []       # filled by scan(); see ScanResult.evidence
 
     def rows(self, key):
         return self.findings.get(key) or []
@@ -1923,6 +2001,10 @@ class ScanResult(object):
                     for r in rows("content_topic")],
                 "topic_overlap_method": "tf-idf cosine over body terms; "
                                         "lexical, not semantic — no synonym matching",
+                # Per-page closest matches, not only the flagged clusters. A
+                # consumer wants to answer "what is this page nearest to" for
+                # any page, at whatever threshold it cares about.
+                "nearest": self.nearest,
             },
             # Every meta count is given twice: the raw total, and the total with
             # blog posts removed. Threshold on the _excl_blog figure — blog meta
@@ -2013,6 +2095,17 @@ def scan(domain, opts=None, progress=None, verbose=False, **kw):
                         len(cache), opts)
     result.dupe_scope = {"checked": len(indexable),
                          "skipped_not_indexable": len(live) - len(indexable)}
+
+    # Closest matches per page. Index against the list similarity_graph returns,
+    # NOT the one passed in — it filters pages below the distinct-term floor, so
+    # the indices differ and using `indexable` here mislabels every row.
+    graph_nodes, _, neighbours = similarity_graph(indexable)
+    result.nearest = [
+        {"page": graph_nodes[i]["url"],
+         "closest": [{"page": graph_nodes[j]["url"],
+                      "term_overlap_pct": round(s * 100)} for s, j in near]}
+        for i, near in sorted(neighbours.items())
+    ]
     return result
 
 
