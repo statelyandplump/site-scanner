@@ -397,6 +397,131 @@ def test_blog_segmentation():
         check("%s is not blog-segmented" % key, key not in S.BLOG_SEGMENTED)
 
 
+def test_topic_overlap():
+    """Same topic in different words — the case shingles cannot see."""
+    print("\ntopic overlap")
+
+    def pg(url, text):
+        return {"url": url, "final_url": url, "canonical": "", "noindex": False,
+                "words": len(text.split()), "terms": S.terms_of(text),
+                "shingles": S.shingles(text),
+                "text_hash": hashlib.sha1(text.encode()).hexdigest()}
+
+    # Same subject, deliberately almost no shared phrasing.
+    a = pg("https://ex.com/anxiety-therapy/", """
+        Anxiety therapy helps adults who feel constant worry, racing thoughts and
+        physical tension. Our clinicians treat panic attacks, social anxiety and
+        generalised anxiety using cognitive behavioural techniques and exposure
+        work. Sessions focus on identifying anxious thoughts, testing them, and
+        building tolerance for the physical sensations of panic. Many clients
+        notice their worry becoming less constant within a few months of weekly
+        anxiety treatment with a licensed clinician.""")
+    b = pg("https://ex.com/help-with-worry/", """
+        Struggling with worry? Treatment for anxiety gives adults practical tools
+        for racing thoughts, panic and the physical tension anxiety produces. Our
+        licensed clinicians use cognitive behavioural techniques and graded
+        exposure to treat panic attacks, social anxiety and generalised worry.
+        Weekly sessions build tolerance for anxious physical sensations and test
+        anxious thoughts directly, and most clients find constant worry eases
+        within months of starting anxiety treatment.""")
+    # A genuinely different subject, same page shape and length.
+    c = pg("https://ex.com/couples-counselling/", """
+        Couples counselling gives partners a structured place to slow down
+        arguments and rebuild trust that distance wears away. Sessions focus on
+        communication patterns, repair after conflict, and the resentment that
+        accumulates when partners stop turning toward each other. Our clinicians
+        work with married and unmarried couples, including partners considering
+        separation, and help each person hear what the other is actually asking
+        for during a disagreement.""")
+
+    check("shingles miss the reworded pair (this is why TF-IDF was added)",
+          S.jaccard(a["shingles"], b["shingles"]) < 0.2,
+          round(S.jaccard(a["shingles"], b["shingles"]), 3))
+
+    pairs = S.find_topic_overlap([a, b, c], threshold=0.45)
+    found = {frozenset((x["url"], y["url"])) for x, y, _ in pairs}
+    check("reworded same-topic pair IS caught",
+          frozenset((a["url"], b["url"])) in found,
+          [(x["url"], y["url"], round(s, 2)) for x, y, s in pairs])
+    check("different topic is NOT caught",
+          not any(c["url"] in p for p in found),
+          [(x["url"], y["url"], round(s, 2)) for x, y, s in pairs])
+
+    # Blog-vs-blog is excluded by default; several posts on one theme is normal.
+    # Must clear TOPIC_MIN_TERMS distinct terms or they are skipped, not scored.
+    # An earlier version of this fixture had 38 and scored 0.61 — correctly
+    # filtered, which made the check look broken when it was the fixture.
+    b1 = pg("https://ex.com/blog/anxiety-tips/", """
+        Anxiety therapy helps adults who feel constant worry, racing thoughts and
+        physical tension. Clinicians treat panic attacks, social anxiety and
+        generalised anxiety using cognitive behavioural techniques and exposure
+        work. Sessions identify anxious thoughts, test them, and build tolerance
+        for the physical sensations of panic. Clients notice worry becoming less
+        constant within months of weekly anxiety treatment. Appointments run
+        evenings and weekends, insurance is accepted, and telehealth appointments
+        remain available across the region for anyone unable to travel.""")
+    b2 = pg("https://ex.com/blog/managing-worry/", """
+        Struggling with worry? Treatment for anxiety gives adults practical tools
+        for racing thoughts, panic and physical tension. Licensed clinicians use
+        cognitive behavioural techniques and graded exposure for panic attacks,
+        social anxiety and generalised worry. Weekly sessions build tolerance for
+        anxious physical sensations and test anxious thoughts, and constant worry
+        eases within months of starting anxiety treatment. Evening and weekend
+        appointments are available, insurance accepted, with telehealth across
+        the region for anyone who cannot travel to the office.""")
+    blog_only = S.find_topic_overlap([b1, b2], threshold=0.3)
+    check("blog-vs-blog excluded by default", blog_only == [], blog_only)
+    check("blog-vs-blog included on request",
+          len(S.find_topic_overlap([b1, b2], threshold=0.3, include_blog=True)) == 1)
+
+    # Clusters, not pairs: N templated pages are one finding, not N-choose-2.
+    towns = ["denver", "aurora", "lakewood", "boulder", "littleton"]
+    tpl = ("Our %s office offers therapy for adults across the metro area. "
+           "Clinicians in %s treat anxiety, depression, trauma and relationship "
+           "difficulties, with evening and weekend appointments, insurance "
+           "accepted, and telehealth for anyone unable to travel. Book a free "
+           "consultation with a licensed clinician near %s today and begin "
+           "feeling steadier within weeks of starting regular sessions. Parking "
+           "is available onsite and the building has step-free access "
+           "throughout, including accessible bathrooms near reception.")
+    geo = [pg("https://ex.com/therapy-%s/" % t, tpl % (t, t, t)) for t in towns]
+    clusters = S.topic_clusters(geo + [c], threshold=0.5)
+    check("templated pages collapse to ONE cluster, not 10 pairs",
+          len(clusters) == 1, [(len(m), round(h, 2)) for m, l, h in clusters])
+    check("the cluster names every member",
+          clusters and len(clusters[0][0]) == 5, clusters and clusters[0][0])
+    check("the unrelated page stays out of the cluster",
+          clusters and c["url"] not in clusters[0][0], clusters and clusters[0][0])
+    check("cluster reports a score range",
+          clusters and 0 < clusters[0][1] <= clusters[0][2] <= 1.0,
+          clusters and clusters[0][1:])
+
+    # Regression guard for the self-erasure bug: a corpus that is ENTIRELY one
+    # template must still score high. Dropping terms present on every page made
+    # this exactly 0.0, and only on the small sites the check matters most for.
+    only_geo = S.topic_clusters(geo, threshold=0.5)
+    check("an all-template corpus still scores (no self-erasure)",
+          len(only_geo) == 1 and len(only_geo[0][0]) == 5,
+          [(len(m), round(h, 2)) for m, l, h in only_geo])
+    vecs = S.tfidf_vectors([{"terms": p["terms"]} for p in geo])
+    score = S.cosine(vecs[0], vecs[1])
+    # Not near 1.0, and correctly so: with a tiny corpus the one differing term
+    # (the town) has df=1 and carries far more IDF weight than the shared
+    # vocabulary at df=n. What matters is that it clears the default threshold.
+    check("terms on every page keep a usable weight",
+          score > S.TOPIC_RATIO, round(score, 3))
+
+    check("too-short pages are skipped, not scored",
+          S.find_topic_overlap([pg("https://ex.com/x/", "short page"),
+                                pg("https://ex.com/y/", "short page")]) == [])
+
+    # Wording must matter, not just length: identical vocabulary, opposite order
+    # should still score high (bag of words), which is the documented tradeoff.
+    check("stopwords excluded from terms", "the" not in S.terms_of("the cat sat"))
+    check("short tokens excluded", "at" not in S.terms_of("sat at mat"))
+    check("real terms kept", "anxiety" in S.terms_of("anxiety therapy helps"))
+
+
 def test_indexability_and_exact():
     """Match Screaming Frog: exact dupes separately, indexable pages only."""
     print("\nexact duplicates and indexability")
@@ -607,6 +732,7 @@ def main():
     test_import_surface()
     test_blog_segmentation()
     test_indexability_and_exact()
+    test_topic_overlap()
     test_throttle_retry()
     test_siteliner_caveat()
     print("")

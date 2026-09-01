@@ -26,6 +26,7 @@ import csv
 import gzip
 import hashlib
 import json
+import math
 import html
 import os
 import re
@@ -515,6 +516,33 @@ def parse_page(body):
 WORD_RE = re.compile(r"[a-z0-9']+")
 SHINGLE_N = 6
 
+# Shingles catch pages that share PHRASES. They score ~0 on two pages that say
+# the same thing in different words — which is the more common and more damaging
+# case: two pages built for the same topic, competing with each other.
+#
+# TF-IDF cosine over single terms catches that middle band with no model and no
+# API key. It does not do synonymy: "worry" and "anxiety" are unrelated tokens
+# here. Real embeddings would catch that, at the cost of an API key and a
+# per-crawl charge — see README.
+# Calibrated against a 122-page site with five templated location pages. Those
+# scored 58-68% against each other; the highest unrelated pair was terms-of-service
+# vs privacy-policy at 35%, and two genuinely different service pages scored 34%.
+# 0.50 sits in the gap with margin on both sides.
+TOPIC_RATIO = 0.50      # cosine above which two pages are "the same topic"
+TOPIC_MIN_TERMS = 40    # too few distinct terms and cosine is meaningless
+
+# Small closed-class list. Not a full stopword set — TF-IDF already discounts
+# anything common across the corpus. This just removes the words so frequent
+# that they distort short pages.
+STOPWORDS = frozenset("""
+a an and are as at be been but by can do does for from had has have he her his
+how i if in into is it its me my no not of on or our out she so than that the
+their them then there these they this to too us was we were what when where
+which who will with would you your about after all also any because before
+being between both during each few more most other over same some such through
+under until up very via while
+""".split())
+
 
 def shingles(text):
     """Set of overlapping 6-word phrases. Order-sensitive, cheap, good enough."""
@@ -525,6 +553,118 @@ def shingles(text):
         hash(" ".join(words[i:i + SHINGLE_N]))
         for i in range(len(words) - SHINGLE_N + 1)
     }
+
+
+def terms_of(text):
+    """Bag of meaningful terms for TF-IDF. Counter of word -> frequency."""
+    return Counter(w for w in WORD_RE.findall(text.lower())
+                   if len(w) > 2 and w not in STOPWORDS)
+
+
+def tfidf_vectors(pages):
+    """L2-normalised TF-IDF vector per page, as {term: weight}.
+
+    Normalising means cosine is a plain dot product, so the pair loop stays
+    cheap: iterate the shorter vector and look up the longer one.
+    """
+    n = len(pages)
+    doc_freq = Counter()
+    for p in pages:
+        doc_freq.update(p["terms"].keys())
+
+    vectors = []
+    for p in pages:
+        vec = {}
+        for term, tf in p["terms"].items():
+            df = doc_freq[term]
+            # No hard exclusion for terms on every page. An earlier version
+            # dropped df == n as "navigation", which meant a corpus made mostly
+            # of one template erased its own shared vocabulary and scored 0.0 —
+            # the same self-erasure already fixed in the shingle path, and it
+            # only failed on the small multi-location sites that need it most.
+            # Smoothed IDF already handles it: df == n gives log(2), a real but
+            # small weight, which is exactly the intent.
+            #
+            # Sublinear TF so one word repeated 50 times cannot dominate.
+            vec[term] = (1.0 + math.log(tf)) * math.log(1.0 + n / float(df))
+        norm = math.sqrt(sum(w * w for w in vec.values()))
+        vectors.append({t: w / norm for t, w in vec.items()} if norm else {})
+    return vectors
+
+
+def cosine(a, b):
+    if len(a) > len(b):
+        a, b = b, a
+    return sum(w * b.get(t, 0.0) for t, w in a.items())
+
+
+def find_topic_overlap(pages, threshold=TOPIC_RATIO, include_blog=False):
+    """Pages covering the same topic in different words.
+
+    Returns [(page_a, page_b, score)] sorted by score. These are CANDIDATES to
+    review, not proven cannibalisation — two pages can rank for different
+    queries and both earn their traffic, and merging them destroys one. Proving
+    competition needs a live SERP check this tool does not do.
+    """
+    live = [p for p in pages if len(p.get("terms") or ()) >= TOPIC_MIN_TERMS]
+    if len(live) < 2:
+        return []
+
+    vectors = tfidf_vectors(live)
+    out = []
+    for i, a in enumerate(live):
+        for j in range(i + 1, len(live)):
+            b = live[j]
+            # Two blog posts about anxiety are expected on a content site and
+            # would swamp the finding. Pairs involving a non-blog page are the
+            # ones worth a look.
+            if not include_blog and is_blog(a["url"]) and is_blog(b["url"]):
+                continue
+            score = cosine(vectors[i], vectors[j])
+            if score >= threshold:
+                out.append((a, b, score))
+    out.sort(key=lambda t: -t[2])
+    return out
+
+
+def topic_clusters(pages, threshold=TOPIC_RATIO, include_blog=False):
+    """Group overlapping pages into sets, not pairs.
+
+    Five templated location pages produce ten pairs, which reads as ten problems
+    when it is one: a page template reused across five towns. Connected
+    components over the pair graph collapse that into a single row naming all
+    five. Returns [(sorted_urls, low_score, high_score)].
+    """
+    pairs = find_topic_overlap(pages, threshold, include_blog)
+    if not pairs:
+        return []
+
+    adjacent = defaultdict(set)
+    scores = {}
+    for a, b, s in pairs:
+        adjacent[a["url"]].add(b["url"])
+        adjacent[b["url"]].add(a["url"])
+        scores[frozenset((a["url"], b["url"]))] = s
+
+    clusters, seen = [], set()
+    for start in sorted(adjacent):
+        if start in seen:
+            continue
+        # Breadth-first walk of one connected component.
+        members, queue = set(), [start]
+        while queue:
+            node = queue.pop()
+            if node in members:
+                continue
+            members.add(node)
+            queue.extend(adjacent[node] - members)
+        seen |= members
+
+        inside = [s for pair, s in scores.items() if pair <= members]
+        clusters.append((sorted(members), min(inside), max(inside)))
+
+    clusters.sort(key=lambda c: (-len(c[0]), -c[2]))
+    return clusters
 
 
 def jaccard(a, b):
@@ -764,6 +904,7 @@ def scan_page(url, site_host, opts):
         "words": words,
         "text_hash": hashlib.sha1(text.encode("utf-8", "replace")).hexdigest(),
         "shingles": shingles(text),
+        "terms": terms_of(text),
         "links": links,
         "images": images,
         "noindex": "noindex" in p.meta_robots,
@@ -1054,6 +1195,26 @@ def build_findings(pages, assets, opts):
             "unit": "% similar",
         })
 
+    # -- same topic, different words. Pairs already reported as duplicates would
+    # only be said twice, so skip them.
+    dupe_seen = {u for key in ("content_exact", "content_duplicate")
+                 for r in f.get(key) or [] for u in [r["url"]] + r.get("group", [])}
+    for members, low, high in topic_clusters(
+            indexable, getattr(opts, "topic_ratio", TOPIC_RATIO),
+            getattr(opts, "include_blog_topics", False)):
+        if all(u in dupe_seen for u in members):
+            continue
+        head, rest = members[0], members[1:]
+        f["content_topic"].append({
+            "url": head,
+            "detail": "%d pages share %d-%d%% of their vocabulary: %s" % (
+                len(members), round(low * 100), round(high * 100),
+                ", ".join(rest[:3]) + (", ..." if len(rest) > 3 else "")),
+            "group": rest,
+            "value": round(high * 100), "unit": "% term overlap",
+            "text": "%d pages" % len(members),
+        })
+
     return f, live, boiler
 
 
@@ -1076,6 +1237,12 @@ ISSUES = [
     ("content_duplicate", "high", "Near-duplicate page content",
      "At or above 90% similar after shared nav and footer are stripped — the same "
      "threshold Screaming Frog uses. Usually templated city pages. Consolidate or rewrite."),
+    ("content_topic",     "med",  "Pages covering the same topic",
+     "Different wording, heavily overlapping vocabulary — these may be built for "
+     "the same search. CANDIDATES TO REVIEW, not proven competition: two pages "
+     "can rank for different queries and both earn traffic, and merging them "
+     "destroys one. Search each page's target term and see whether both actually "
+     "appear before changing anything."),
     ("title_duplicate",   "med",  "Duplicate title tags",
      "Each page needs its own title. Duplicates usually mean a template is not filling in."),
     ("title_missing",     "high", "Missing title tags",
@@ -1358,7 +1525,10 @@ class Options(object):
 
     def __init__(self, limit=None, workers=6, timeout=15, image_kb=IMAGE_KB,
                  banner_kb=BANNER_KB, dupe_ratio=DUPE_RATIO, external=True,
-                 out=None, json=False, exclude_blog=False, delay=CRAWL_DELAY):
+                 out=None, json=False, exclude_blog=False, delay=CRAWL_DELAY,
+                 topic_ratio=TOPIC_RATIO, include_blog_topics=False):
+        self.topic_ratio = topic_ratio
+        self.include_blog_topics = include_blog_topics
         self.delay = delay
         self.exclude_blog = exclude_blog
         self.limit = limit
@@ -1467,6 +1637,16 @@ class ScanResult(object):
                 "duplicate_clusters": [{"pages": [r["url"]] + r.get("group", [])}
                                        for r in rows("content_duplicate")],
                 "duplicate_cluster_count": count("content_duplicate"),
+                # Same topic, different words. Candidates only — competition is
+                # not established without a live SERP check.
+                "topic_overlap_threshold": o.topic_ratio,
+                "topic_cluster_count": count("content_topic"),
+                "topic_clusters": [
+                    {"pages": [r["url"]] + r.get("group", []),
+                     "max_term_overlap_pct": r.get("value")}
+                    for r in rows("content_topic")],
+                "topic_overlap_method": "tf-idf cosine over body terms; "
+                                        "lexical, not semantic — no synonym matching",
             },
             # Every meta count is given twice: the raw total, and the total with
             # blog posts removed. Threshold on the _excl_blog figure — blog meta
@@ -1662,6 +1842,12 @@ def main():
                    help="Content overlap counted as duplicate, 0-1 (default %.2f)" % DUPE_RATIO)
     p.add_argument("--no-external", dest="external", action="store_false",
                    help="Skip checking outbound links (much faster)")
+    p.add_argument("--topic-ratio", type=float, default=TOPIC_RATIO,
+                   help="Term overlap at which two pages are flagged as the same "
+                        "topic, 0-1 (default %.2f). Lower finds more." % TOPIC_RATIO)
+    p.add_argument("--include-blog-topics", action="store_true",
+                   help="Also compare blog posts against each other for topic "
+                        "overlap (noisy — several posts on one theme is normal)")
     p.add_argument("--exclude-blog", action="store_true",
                    help="Drop blog posts from the title/description/H1 findings "
                         "entirely instead of labelling them")

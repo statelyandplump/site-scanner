@@ -103,8 +103,9 @@ page; everything else is collapsed until you click it.
 | Near-duplicate page content | 90% or more similar after nav and footer are stripped — the same threshold Screaming Frog uses. Usually templated city pages. |
 | Missing title tags | Self-explanatory. |
 
-**Medium** covers duplicate titles and descriptions, missing H1s, missing meta
-descriptions, images over 1 MB, and **links that could not be checked** — read
+**Medium** covers **pages covering the same topic** (see below), duplicate titles
+and descriptions, missing H1s, missing meta descriptions, images over 1 MB, and
+**links that could not be checked** — read
 that last one carefully: it means the server rate-limited us and the link's real
 status is unknown. It is *not* a list of broken links. If it has entries, re-run
 with a longer `--delay`. **Low** is the long tail: title and
@@ -122,6 +123,28 @@ Three things worth knowing when you read it:
   decorative image. The scanner separates "no alt attribute at all" (a real
   problem, listed as High) from "empty alt" (listed as Low, and often correct).
   Images with names like `spacer` or `divider` are not flagged at all.
+- **"Pages covering the same topic" are candidates, not verdicts.** There are
+  two similarity checks and they catch different things. *Near-duplicate*
+  compares phrasing, so it finds copy-paste. *Same topic* compares weighted
+  vocabulary, so it finds pages built for the same search even when the wording
+  was varied — five location pages that a phrasing check sails straight past.
+  Overlapping pages are then grouped, so five templated pages are one row and
+  not ten pairs.
+
+  Two pages covering one topic is **not proof they compete**. They can rank for
+  different queries and both earn traffic, and merging them destroys one. Search
+  each page's target term and check whether both actually appear before changing
+  anything. Tune with `--topic-ratio` (default 0.50); blog-vs-blog pairs are
+  excluded unless you pass `--include-blog-topics`, since several posts on one
+  theme is normal.
+
+  This is lexical, not semantic: it has no idea that "worry" and "anxiety" mean
+  the same thing. Catching synonyms needs vector embeddings from an AI provider,
+  which means an API key and a per-crawl charge — deliberately not built in,
+  because it would end the no-key, no-install property that lets anyone run
+  this. `scan()` returns the page text, so bolting embeddings on top is
+  straightforward if you want it.
+
 - **Outbound link results vary slightly between runs.** Third-party sites time
   out and drop TLS connections at random, and some servers answer the same URL
   inconsistently. Internal links are stable; treat a one-off external failure as
